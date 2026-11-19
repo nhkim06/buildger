@@ -4,7 +4,7 @@
 
 - 기준 스키마: `src/main/resources/sql/create_table.sql` (**변경하지 않음**)
 - 참고 문서: `docs/database.md`
-- 문서 상태: **MVP 확정안** — 아직 구현되지 않음
+- 문서 상태: **MVP 확정안 — 구현 완료** (구현 기록: `docs/api-developed.md`)
 
 > **MVP 원칙:** 기존 `account`, `project`, `data`, `storage` 4개 테이블의 테이블·컬럼·제약조건·인덱스를 변경하지 않는다. 참여자, 파일 연결, 서명, AI 분석, 정정·무효화, Soft Delete 정보는 모두 기존 JSONB 컬럼(`project.detail`, `data.metadata`)에 [3장](#3-jsonb-저장-구조)의 구조로 저장한다.
 
@@ -566,7 +566,7 @@ JSONB 내부 데이터에는 FK·UNIQUE·CHECK 제약을 걸 수 없으므로, �
 - **잠금 순서 고정:** 항상 `project` → `data`(원본) → `data`(대상) 순으로 잠가 교착 상태를 예방한다.
 - **잠금 조회 방식:** Repository에 `@Lock(PESSIMISTIC_WRITE)`(FOR UPDATE), `@Lock(PESSIMISTIC_READ)`(FOR SHARE) 조회 메서드를 두고, 트랜잭션 안에서 **해당 행을 처음 읽을 때** 잠금 조회를 사용한다. 이미 영속성 컨텍스트에 있는 엔티티는 `EntityManager.refresh(entity, LockModeType.PESSIMISTIC_WRITE)`로 잠그고 최신 값을 다시 읽는다. (1차 캐시의 오래된 JSONB로 덮어쓰기 방지)
 - **잠금 후 재검증:** 잠금 획득 후 삭제 여부, 서명 여부, 정정 여부, 참여자 권한, 중복을 다시 검사한다.
-- **대기 시간:** `jakarta.persistence.lock.timeout=3000`. 초과(`PessimisticLockException`, `LockTimeoutException`)와 교착 상태(SQLState `40P01`)는 409 `CONCURRENT_MODIFICATION`으로 응답한다. 서버에서 자동 재시도하지 않는다.
+- **대기 시간:** 커넥션 초기화 SQL `SET lock_timeout = '3s'`(`spring.datasource.hikari.connection-init-sql`)로 3초를 적용한다. (PostgreSQL에서는 JPA `lock.timeout` 힌트의 양수 값이 `FOR UPDATE` 구문에 반영되지 않기 때문) 초과(SQLState `55P03`)와 교착 상태(`40P01`)는 Spring의 `PessimisticLockingFailureException`으로 변환되어 409 `CONCURRENT_MODIFICATION`으로 응답한다. 서버에서 자동 재시도하지 않는다.
 - **파일 저장:** 이미지 검증과 SHA-256 계산은 잠금 전에 수행해 잠금 시간을 줄이고, `storage` INSERT와 `metadata.files` 갱신은 잠금을 잡은 같은 트랜잭션에서 처리한다. (고아 파일 방지)
 - **외부 호출:** AI 서버 호출은 트랜잭션과 잠금 밖에서 수행한다. ([13.1](#131-ai-분석-요청결과-저장))
 
@@ -1455,6 +1455,7 @@ WHERE (p.created_by = :uid
 | 409 | RECORD_NOT_LOCKED | 서명 전 기록 |
 | 409 | RECORD_ALREADY_CORRECTED | 이미 정정됨 (`message`에 최신 기록 ID 포함) |
 | 409 | RECORD_INVALIDATED | 무효화된 기록 |
+| 409 | INVALID_RECORD_TYPE | 대상이 무효화(INVALIDATION) 기록 |
 | 409 | CONCURRENT_MODIFICATION | 잠금 대기 시간 초과 |
 
 **비즈니스 로직**
@@ -1517,6 +1518,7 @@ WHERE (p.created_by = :uid
 | 409 | RECORD_NOT_LOCKED | 서명 전 기록 → 9.5 삭제 사용 |
 | 409 | RECORD_ALREADY_CORRECTED | 이미 정정된 기록 (체인의 최신 기록을 무효화해야 함) |
 | 409 | RECORD_INVALIDATED | 이미 무효화됨 |
+| 409 | INVALID_RECORD_TYPE | 대상이 무효화(INVALIDATION) 기록 |
 | 409 | CONCURRENT_MODIFICATION | 잠금 대기 시간 초과 |
 
 **비즈니스 로직**
@@ -1664,6 +1666,7 @@ Swagger에서 `@Schema(type = "string", format = "binary")` 배열로 문서화�
 
 **비즈니스 로직 (단일 트랜잭션, 전체 성공 또는 전체 실패)**
 
+0. 읽기 전용 트랜잭션에서 참여자·권한·기록 상태(삭제·서명·유형)를 먼저 확인한다. (권한 없는 요청에 대해 이미지 처리를 하지 않기 위함)
 1. 잠금 전에 모든 파일을 [11.0 검증 순서](#검증-순서-imagefilevalidator) 1~7단계로 검증하고, 요청 내 중복 해시를 확인한다.
 2. `project` FOR SHARE → `data` FOR UPDATE 순으로 잠그고 삭제 여부·서명 여부·사진 수·기존 파일과의 해시 중복을 다시 확인한다.
 3. `storage`에 `name`·`image`를 INSERT하고, 생성된 `storageId`로 `metadata.files`에 메타데이터를 추가한다.
@@ -1827,7 +1830,8 @@ Swagger에서 `@Schema(type = "string", format = "binary")` 배열로 문서화�
 
 **비즈니스 로직 (단일 트랜잭션)**
 
-1. 잠금 전에 서명 이미지를 [11.0 검증 순서](#검증-순서-imagefilevalidator)로 검증하고 SHA-256을 계산한다.
+0. 읽기 전용 트랜잭션에서 참여자·계정 역할(시공사·시행사)·기록 존재를 먼저 확인한다.
+1. 잠금 전에 요청 값과 서명 이미지를 [11.0 검증 순서](#검증-순서-imagefilevalidator)로 검증하고 SHA-256을 계산한다.
 2. `project` FOR SHARE → `data` FOR UPDATE 순으로 잠그고 삭제·정정·무효화 상태와 중복 확인 여부를 다시 확인한다.
 3. 삭제되지 않은 첨부 이미지의 `storage.image` 해시를 다시 계산해 `files[].sha256`과 비교하고, 기존 서명이 있으면 스냅샷 해시도 비교한다. 불일치하면 409 `INTEGRITY_MISMATCH`. ([4.4](#44-서명-스냅샷-해시))
 4. `storage`에 서명 이미지를 저장한다.
@@ -2096,6 +2100,7 @@ Client ──POST /ai-analyses──▶ Spring Boot ──(파일 전송)──�
 | 401 | TOKEN_EXPIRED | 토큰 만료 |
 | 401 | LOGIN_FAILED | 로그인 ID 또는 비밀번호 불일치 |
 | 401 | INVALID_CURRENT_PASSWORD | 현재 비밀번호 불일치 |
+| 403 | ACCESS_DENIED | 보안 필터 단계의 접근 거부 (일반적으로 발생하지 않음) |
 | 403 | ROLE_NOT_ALLOWED | 계정 역할상 허용되지 않음 |
 | 403 | PROJECT_ACCESS_DENIED | 프로젝트 참여자가 아님 |
 | 403 | INSUFFICIENT_PROJECT_ROLE | 프로젝트 역할 권한 부족 |
@@ -2105,6 +2110,7 @@ Client ──POST /ai-analyses──▶ Spring Boot ──(파일 전송)──�
 | 404 | RECORD_NOT_FOUND | 시공 기록 없음 또는 삭제됨 |
 | 404 | FILE_NOT_FOUND | 파일 없음 또는 삭제됨 |
 | 404 | AI_ANALYSIS_NOT_FOUND | AI 분석 결과 없음 |
+| 404 | RESOURCE_NOT_FOUND | 존재하지 않는 URL |
 | 405 | METHOD_NOT_ALLOWED | 지원하지 않는 HTTP Method |
 | 409 | DUPLICATE_LOGIN_ID | 로그인 ID 중복 |
 | 409 | ALREADY_PROJECT_MEMBER | 이미 프로젝트 참여자 |
